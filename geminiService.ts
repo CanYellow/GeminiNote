@@ -1,18 +1,26 @@
+
 import { GoogleGenAI } from "@google/genai";
-import { GenerationRequest, GenerationResponse } from "./types";
-import { Notice } from "obsidian";
+import { GenerationRequest, GenerationResponse, OutputAction } from "./types";
 
 export class GeminiService {
     private apiKey: string;
     private apiHost: string;
     private modelName: string;
-    private metaPrompt: string;
+    private createNoteMetaPrompt: string;
+    private inPlaceMetaPrompt: string;
 
-    constructor(apiKey: string, apiHost: string, modelName: string, metaPrompt: string) {
+    constructor(
+        apiKey: string, 
+        apiHost: string, 
+        modelName: string, 
+        createNoteMetaPrompt: string,
+        inPlaceMetaPrompt: string
+    ) {
         this.apiKey = apiKey;
         this.apiHost = apiHost;
         this.modelName = modelName;
-        this.metaPrompt = metaPrompt;
+        this.createNoteMetaPrompt = createNoteMetaPrompt;
+        this.inPlaceMetaPrompt = inPlaceMetaPrompt;
     }
 
     async generateNote(request: GenerationRequest): Promise<GenerationResponse> {
@@ -20,69 +28,83 @@ export class GeminiService {
             throw new Error("API Key not set");
         }
 
-        const payload = {
-            userInstruction: request.instructionContent,
-            selectedText: request.selectedText,
-            parentNoteContent: request.contextType === 'selection_and_full_note' ? request.parentNoteContent : undefined,
-            parentNoteTitle: request.parentNoteTitle
-        };
+        let fullPrompt = "";
+        const isCreateNote = request.outputAction === 'create_note';
 
-        const fullPrompt = `${this.metaPrompt}\n\nInput Data:\n${JSON.stringify(payload, null, 2)}`;
+        if (isCreateNote) {
+            // Strategy: Structured JSON for new file
+            const payload = {
+                userInstruction: request.instructionContent,
+                selectedText: request.selectedText,
+                parentNoteContent: request.contextType === 'selection_and_full_note' ? request.parentNoteContent : undefined,
+                parentNoteTitle: request.parentNoteTitle
+            };
+            fullPrompt = `${this.createNoteMetaPrompt}\n\nInput Data:\n${JSON.stringify(payload, null, 2)}`;
+        } else {
+            // Strategy: Fluent Text for In-Place
+            fullPrompt = `${this.inPlaceMetaPrompt}
+            
+---
+EXISTING TEXT BEFORE SELECTION:
+...${request.contextBefore}
+
+---
+USER SELECTED TEXT (To be modified/processed):
+${request.selectedText}
+
+---
+EXISTING TEXT AFTER SELECTION:
+${request.contextAfter}...
+
+---
+USER INSTRUCTION:
+${request.instructionContent}
+`;
+        }
 
         // LOGIC BRANCH: Custom Host vs Default SDK
+        let responseText = "";
         if (this.apiHost && this.apiHost.trim() !== '') {
-            return this.generateWithCustomHost(fullPrompt);
+            responseText = await this.generateWithCustomHost(fullPrompt);
         } else {
-            return this.generateWithSdk(fullPrompt);
+            responseText = await this.generateWithSdk(fullPrompt);
         }
+
+        return this.parseResponse(responseText, isCreateNote);
     }
 
-    private async generateWithSdk(prompt: string): Promise<GenerationResponse> {
+    private async generateWithSdk(prompt: string): Promise<string> {
         const ai = new GoogleGenAI({ apiKey: this.apiKey });
         try {
             const response = await ai.models.generateContent({
                 model: this.modelName,
                 contents: prompt
             });
-            const responseText = response.text || "";
-            return this.parseResponse(responseText, ""); // passing empty originalSelection as fallback isn't needed here usually
+            return response.text || "";
         } catch (error) {
             console.error("Gemini SDK Error:", error);
             throw new Error(`Gemini SDK Error: ${error.message || error}`);
         }
     }
 
-    private async generateWithCustomHost(prompt: string): Promise<GenerationResponse> {
-        // 1. Sanitize Host URL
+    private async generateWithCustomHost(prompt: string): Promise<string> {
         let host = this.apiHost.trim();
-        // Fix common typo: https:/gemini -> https://gemini
         if (host.startsWith("https:/") && !host.startsWith("https://")) {
             host = host.replace("https:/", "https://");
         }
-        // Remove trailing slash
         if (host.endsWith("/")) {
             host = host.slice(0, -1);
         }
 
-        // 2. Construct URL matching the user's working example structure
-        // Pattern: ${API_HOST}/v1beta/models/${model}:generateContent?key=${API_KEY}
         const url = `${host}/v1beta/models/${this.modelName}:generateContent?key=${this.apiKey}`;
-
-        // 3. Construct Body
         const body = {
-            contents: [{
-                parts: [{
-                    text: prompt
-                }]
-            }]
+            contents: [{ parts: [{ text: prompt }] }]
         };
 
         try {
             const response = await fetch(url, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(body)
             });
 
@@ -93,21 +115,15 @@ export class GeminiService {
                     if (errData.error && errData.error.message) {
                         errorMsg += `: ${errData.error.message}`;
                     }
-                } catch (e) { /* ignore json parse error */ }
+                } catch (e) { }
                 throw new Error(errorMsg);
             }
 
             const data = await response.json();
-            
-            // Extract text from Gemini REST response structure
-            // { candidates: [ { content: { parts: [ { text: "..." } ] } } ] }
-            const responseText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+            const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
 
-            if (!responseText) {
-                throw new Error("Empty response from API");
-            }
-
-            return this.parseResponse(responseText, "");
+            if (!text) throw new Error("Empty response from API");
+            return text;
 
         } catch (error) {
             console.error("Custom Host API Error:", error);
@@ -115,43 +131,62 @@ export class GeminiService {
         }
     }
 
-    private parseResponse(rawResponse: string, originalSelection: string): GenerationResponse {
-        let textToParse = rawResponse.trim();
+    private parseResponse(rawResponse: string, expectJson: boolean): GenerationResponse {
+        const textToParse = rawResponse.trim();
 
-        // Tier 1: Strip Markdown Code Blocks
+        if (!expectJson) {
+            // For in-place, we just want the text. 
+            // We strip markdown code blocks if the AI accidentally added them.
+            const codeBlockRegex = /^```(?:\w+)?\s*([\s\S]*?)\s*```$/i;
+            const match = textToParse.match(codeBlockRegex);
+            return {
+                title: "",
+                content: match ? match[1].trim() : textToParse,
+                isFallback: false
+            };
+        }
+
+        // For Create Note, we strictly try to parse JSON
+        
+        // Tier 1: Direct or Cleaned JSON
+        let cleanJson = textToParse;
         const codeBlockRegex = /^```(?:json)?\s*([\s\S]*?)\s*```$/i;
         const match = textToParse.match(codeBlockRegex);
         if (match) {
-            textToParse = match[1].trim();
+            cleanJson = match[1].trim();
         }
 
-        // Tier 2: Direct JSON Parse
         try {
-            const parsed = JSON.parse(textToParse);
+            const parsed = JSON.parse(cleanJson);
             if (this.isValidResponse(parsed)) {
-                return { title: parsed.title, content: parsed.content, isFallback: false };
+                return { 
+                    title: parsed.title, 
+                    content: parsed.content, 
+                    anchorLabel: parsed.anchorLabel,
+                    isFallback: false 
+                };
             }
         } catch (e) { }
 
-        // Tier 3: Resilient JSON Extraction via Regex
+        // Tier 2: Regex Extraction
         try {
             const firstBrace = rawResponse.indexOf('{');
             const lastBrace = rawResponse.lastIndexOf('}');
-            
             if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
                 const jsonSubstring = rawResponse.substring(firstBrace, lastBrace + 1);
                 const parsed = JSON.parse(jsonSubstring);
                 if (this.isValidResponse(parsed)) {
-                    return { title: parsed.title, content: parsed.content, isFallback: false };
+                    return { 
+                        title: parsed.title, 
+                        content: parsed.content, 
+                        anchorLabel: parsed.anchorLabel,
+                        isFallback: false 
+                    };
                 }
             }
         } catch (e) { }
 
-        // Tier 4: Raw Text Fallback
-        // Note: originalSelection might not be available in all paths, but we handle it safely in the main plugin flow 
-        // effectively by passing empty string here and relying on sanitization if needed, 
-        // OR we can just return the raw text and let the main loop handle the title if it's missing.
-        // However, for safety, we return a generic title here if extraction failed.
+        // Tier 3: Fallback
         return {
             title: "Untitled Gemini Note",
             content: rawResponse,
@@ -160,7 +195,8 @@ export class GeminiService {
     }
 
     private isValidResponse(obj: any): boolean {
-        return obj && typeof obj.title === 'string' && obj.title.trim() !== '' && 
-               typeof obj.content === 'string' && obj.content.trim() !== '';
+        return obj && 
+               typeof obj.title === 'string' && 
+               typeof obj.content === 'string';
     }
 }

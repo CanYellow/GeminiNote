@@ -38,11 +38,18 @@ var DEFAULT_SETTINGS = {
   defaultContext: "selection_only",
   defaultSaveLocation: "",
   defaultOutputAction: "create_note",
-  metaPrompt: `You are an assistant integrated into an Obsidian note-taking app. 
-Your task is to process the user's request and provide a structured JSON response with a "title" and "content" for a new note. 
-Output ONLY the raw JSON string. 
-Do not wrap it in markdown code blocks (like \`\`\`json). 
-Do not include any other text, explanations, or formatting.`
+  createNoteMetaPrompt: `You are an assistant integrated into an Obsidian note-taking app. 
+Your task is to process the user's request and provide a structured JSON response for a NEW NOTE.
+Return a JSON object with:
+- "title": A concise filename.
+- "content": The encyclopedic or detailed content of the note.
+- "anchorLabel": A short, descriptive phrase (2-5 words) summarizing the user's selected text. This will be used as the link text in the parent note.
+Output ONLY the raw JSON string. Do not wrap it in markdown code blocks.`,
+  inPlaceMetaPrompt: `You are an expert editor and co-author. 
+Your task is to generate text that fits seamlessly into an existing document.
+You will be provided with the text BEFORE the selection, the SELECTION itself, and the text AFTER.
+Based on the user's instruction, rewrite or expand the SELECTION so it flows naturally between the BEFORE and AFTER context.
+Output ONLY the new text content. Do not output JSON. Do not include conversational filler.`
 };
 
 // settings.ts
@@ -113,14 +120,25 @@ var GeminiNoteSettingTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.settings.defaultSaveLocation = value;
       await this.plugin.saveSettings();
     }));
-    const promptControl = addBlockSetting("Meta Prompt", "The system instruction sent to the AI. Explicitly define the JSON structure here.");
-    const promptInput = promptControl.createEl("textarea");
-    promptInput.style.width = "100%";
-    promptInput.style.height = "150px";
-    promptInput.style.fontFamily = "monospace";
-    promptInput.value = this.plugin.settings.metaPrompt;
-    promptInput.addEventListener("change", async () => {
-      this.plugin.settings.metaPrompt = promptInput.value;
+    containerEl.createEl("h3", { text: "Meta Prompts (System Instructions)" });
+    const createNotePromptControl = addBlockSetting("Create Note Meta Prompt", 'Instructions used when "Create New Note" is selected. MUST strictly enforce JSON output with "title", "content", and "anchorLabel".');
+    const createNotePromptInput = createNotePromptControl.createEl("textarea");
+    createNotePromptInput.style.width = "100%";
+    createNotePromptInput.style.height = "120px";
+    createNotePromptInput.style.fontFamily = "monospace";
+    createNotePromptInput.value = this.plugin.settings.createNoteMetaPrompt;
+    createNotePromptInput.addEventListener("change", async () => {
+      this.plugin.settings.createNoteMetaPrompt = createNotePromptInput.value;
+      await this.plugin.saveSettings();
+    });
+    const inPlacePromptControl = addBlockSetting("In-Place Edit Meta Prompt", "Instructions used when Replacing or Inserting text. Should encourage natural flow and context awareness. Expects raw text output.");
+    const inPlacePromptInput = inPlacePromptControl.createEl("textarea");
+    inPlacePromptInput.style.width = "100%";
+    inPlacePromptInput.style.height = "120px";
+    inPlacePromptInput.style.fontFamily = "monospace";
+    inPlacePromptInput.value = this.plugin.settings.inPlaceMetaPrompt;
+    inPlacePromptInput.addEventListener("change", async () => {
+      this.plugin.settings.inPlaceMetaPrompt = inPlacePromptInput.value;
       await this.plugin.saveSettings();
     });
   }
@@ -14810,31 +14828,57 @@ var GoogleGenAI = class {
 
 // geminiService.ts
 var GeminiService = class {
-  constructor(apiKey, apiHost, modelName, metaPrompt) {
+  constructor(apiKey, apiHost, modelName, createNoteMetaPrompt, inPlaceMetaPrompt) {
     this.apiKey = apiKey;
     this.apiHost = apiHost;
     this.modelName = modelName;
-    this.metaPrompt = metaPrompt;
+    this.createNoteMetaPrompt = createNoteMetaPrompt;
+    this.inPlaceMetaPrompt = inPlaceMetaPrompt;
   }
   async generateNote(request) {
     if (!this.apiKey) {
       throw new Error("API Key not set");
     }
-    const payload = {
-      userInstruction: request.instructionContent,
-      selectedText: request.selectedText,
-      parentNoteContent: request.contextType === "selection_and_full_note" ? request.parentNoteContent : void 0,
-      parentNoteTitle: request.parentNoteTitle
-    };
-    const fullPrompt = `${this.metaPrompt}
+    let fullPrompt = "";
+    const isCreateNote = request.outputAction === "create_note";
+    if (isCreateNote) {
+      const payload = {
+        userInstruction: request.instructionContent,
+        selectedText: request.selectedText,
+        parentNoteContent: request.contextType === "selection_and_full_note" ? request.parentNoteContent : void 0,
+        parentNoteTitle: request.parentNoteTitle
+      };
+      fullPrompt = `${this.createNoteMetaPrompt}
 
 Input Data:
 ${JSON.stringify(payload, null, 2)}`;
-    if (this.apiHost && this.apiHost.trim() !== "") {
-      return this.generateWithCustomHost(fullPrompt);
     } else {
-      return this.generateWithSdk(fullPrompt);
+      fullPrompt = `${this.inPlaceMetaPrompt}
+            
+---
+EXISTING TEXT BEFORE SELECTION:
+...${request.contextBefore}
+
+---
+USER SELECTED TEXT (To be modified/processed):
+${request.selectedText}
+
+---
+EXISTING TEXT AFTER SELECTION:
+${request.contextAfter}...
+
+---
+USER INSTRUCTION:
+${request.instructionContent}
+`;
     }
+    let responseText = "";
+    if (this.apiHost && this.apiHost.trim() !== "") {
+      responseText = await this.generateWithCustomHost(fullPrompt);
+    } else {
+      responseText = await this.generateWithSdk(fullPrompt);
+    }
+    return this.parseResponse(responseText, isCreateNote);
   }
   async generateWithSdk(prompt) {
     const ai = new GoogleGenAI({ apiKey: this.apiKey });
@@ -14843,8 +14887,7 @@ ${JSON.stringify(payload, null, 2)}`;
         model: this.modelName,
         contents: prompt
       });
-      const responseText = response.text || "";
-      return this.parseResponse(responseText, "");
+      return response.text || "";
     } catch (error) {
       console.error("Gemini SDK Error:", error);
       throw new Error(`Gemini SDK Error: ${error.message || error}`);
@@ -14861,18 +14904,12 @@ ${JSON.stringify(payload, null, 2)}`;
     }
     const url = `${host}/v1beta/models/${this.modelName}:generateContent?key=${this.apiKey}`;
     const body = {
-      contents: [{
-        parts: [{
-          text: prompt
-        }]
-      }]
+      contents: [{ parts: [{ text: prompt }] }]
     };
     try {
       const response = await fetch(url, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body)
       });
       if (!response.ok) {
@@ -14887,27 +14924,41 @@ ${JSON.stringify(payload, null, 2)}`;
         throw new Error(errorMsg);
       }
       const data = await response.json();
-      const responseText = (_e = (_d = (_c = (_b = (_a = data.candidates) == null ? void 0 : _a[0]) == null ? void 0 : _b.content) == null ? void 0 : _c.parts) == null ? void 0 : _d[0]) == null ? void 0 : _e.text;
-      if (!responseText) {
+      const text = (_e = (_d = (_c = (_b = (_a = data.candidates) == null ? void 0 : _a[0]) == null ? void 0 : _b.content) == null ? void 0 : _c.parts) == null ? void 0 : _d[0]) == null ? void 0 : _e.text;
+      if (!text)
         throw new Error("Empty response from API");
-      }
-      return this.parseResponse(responseText, "");
+      return text;
     } catch (error) {
       console.error("Custom Host API Error:", error);
       throw new Error(`API Request Failed: ${error.message}`);
     }
   }
-  parseResponse(rawResponse, originalSelection) {
-    let textToParse = rawResponse.trim();
+  parseResponse(rawResponse, expectJson) {
+    const textToParse = rawResponse.trim();
+    if (!expectJson) {
+      const codeBlockRegex2 = /^```(?:\w+)?\s*([\s\S]*?)\s*```$/i;
+      const match2 = textToParse.match(codeBlockRegex2);
+      return {
+        title: "",
+        content: match2 ? match2[1].trim() : textToParse,
+        isFallback: false
+      };
+    }
+    let cleanJson = textToParse;
     const codeBlockRegex = /^```(?:json)?\s*([\s\S]*?)\s*```$/i;
     const match = textToParse.match(codeBlockRegex);
     if (match) {
-      textToParse = match[1].trim();
+      cleanJson = match[1].trim();
     }
     try {
-      const parsed = JSON.parse(textToParse);
+      const parsed = JSON.parse(cleanJson);
       if (this.isValidResponse(parsed)) {
-        return { title: parsed.title, content: parsed.content, isFallback: false };
+        return {
+          title: parsed.title,
+          content: parsed.content,
+          anchorLabel: parsed.anchorLabel,
+          isFallback: false
+        };
       }
     } catch (e) {
     }
@@ -14918,7 +14969,12 @@ ${JSON.stringify(payload, null, 2)}`;
         const jsonSubstring = rawResponse.substring(firstBrace, lastBrace + 1);
         const parsed = JSON.parse(jsonSubstring);
         if (this.isValidResponse(parsed)) {
-          return { title: parsed.title, content: parsed.content, isFallback: false };
+          return {
+            title: parsed.title,
+            content: parsed.content,
+            anchorLabel: parsed.anchorLabel,
+            isFallback: false
+          };
         }
       }
     } catch (e) {
@@ -14930,7 +14986,7 @@ ${JSON.stringify(payload, null, 2)}`;
     };
   }
   isValidResponse(obj) {
-    return obj && typeof obj.title === "string" && obj.title.trim() !== "" && typeof obj.content === "string" && obj.content.trim() !== "";
+    return obj && typeof obj.title === "string" && typeof obj.content === "string";
   }
 };
 
@@ -14970,40 +15026,91 @@ var GeminiNotePlugin = class extends import_obsidian3.Plugin {
       }
       const parentNoteContent = await this.app.vault.read(parentFile);
       const parentNoteTitle = parentFile.name;
+      const cursorFrom = editor.getCursor("from");
+      const cursorTo = editor.getCursor("to");
+      const lastLine = editor.lineCount();
+      const contextBefore = editor.getRange(
+        { line: Math.max(0, cursorFrom.line - 20), ch: 0 },
+        cursorFrom
+      ).slice(-1e3);
+      const contextAfter = editor.getRange(
+        cursorTo,
+        { line: Math.min(lastLine, cursorTo.line + 20), ch: 0 }
+      ).slice(0, 1e3);
       const request = {
         instructionPath: result.instructionPath,
         instructionContent,
         contextType: result.contextType,
         saveLocation: result.saveLocation,
         selectedText,
+        contextBefore,
+        contextAfter,
         parentNoteContent,
-        parentNoteTitle
+        parentNoteTitle,
+        outputAction: result.outputAction
       };
-      this.runGeneration(request, parentFile, editor, result.outputAction);
+      this.runGeneration(request, parentFile, editor);
     }).open();
   }
-  async runGeneration(request, parentFile, editor, outputAction) {
+  async runGeneration(request, parentFile, editor) {
     if (!this.settings.apiKey) {
       new import_obsidian3.Notice("Gemini API key is not set. Please configure it in the plugin settings.");
       return;
     }
+    const snapshotText = request.selectedText;
     const notice = new import_obsidian3.Notice("Generating response with Gemini...", 0);
     try {
       const service = new GeminiService(
         this.settings.apiKey,
         this.settings.apiHost,
         this.settings.modelName,
-        this.settings.metaPrompt
+        this.settings.createNoteMetaPrompt,
+        this.settings.inPlaceMetaPrompt
       );
       const response = await service.generateNote(request);
       notice.hide();
-      if (outputAction === "create_note") {
+      const currentSelection = editor.getSelection();
+      let safeToReplace = false;
+      let needsRelocation = false;
+      if (currentSelection === snapshotText) {
+        safeToReplace = true;
+      } else {
+        const docContent = editor.getValue();
+        const firstIndex = docContent.indexOf(snapshotText);
+        const lastIndex = docContent.lastIndexOf(snapshotText);
+        if (firstIndex !== -1 && firstIndex === lastIndex) {
+          safeToReplace = true;
+          needsRelocation = true;
+          const prefix = docContent.substring(0, firstIndex);
+          const lines = prefix.split("\n");
+          const line = lines.length - 1;
+          const ch = lines[lines.length - 1].length;
+          const endPrefix = docContent.substring(0, firstIndex + snapshotText.length);
+          const endLines = endPrefix.split("\n");
+          const endLine = endLines.length - 1;
+          const endCh = endLines[endLines.length - 1].length;
+          editor.setSelection({ line, ch }, { line: endLine, ch: endCh });
+        }
+      }
+      if (!safeToReplace) {
+        new import_obsidian3.Notice("\u26A0\uFE0F Original selection changed or moved. Copied result to clipboard to prevent data loss.");
+        let clipboardText = "";
+        if (request.outputAction === "create_note") {
+          clipboardText = response.anchorLabel ? `[[${response.title}|${response.anchorLabel}]]` : `[[${response.title}|${snapshotText}]]`;
+          await this.createNoteFile(response, request, parentFile);
+        } else {
+          clipboardText = response.content;
+        }
+        navigator.clipboard.writeText(clipboardText);
+        return;
+      }
+      if (request.outputAction === "create_note") {
         await this.handleCreateNoteAction(response, request, parentFile, editor);
-      } else if (outputAction === "replace_selection") {
+      } else if (request.outputAction === "replace_selection") {
         editor.replaceSelection(response.content);
         new import_obsidian3.Notice("Replaced text with AI generation.");
-      } else if (outputAction === "insert_after") {
-        const newText = request.selectedText + "\n\n" + response.content;
+      } else if (request.outputAction === "insert_after") {
+        const newText = snapshotText + "\n\n" + response.content;
         editor.replaceSelection(newText);
         new import_obsidian3.Notice("Inserted AI generation after selection.");
       }
@@ -15014,7 +15121,20 @@ var GeminiNotePlugin = class extends import_obsidian3.Plugin {
     }
   }
   async handleCreateNoteAction(response, request, parentFile, editor) {
-    var _a, _b;
+    const newFile = await this.createNoteFile(response, request, parentFile);
+    if (!newFile)
+      return;
+    const linkLabel = response.anchorLabel && response.anchorLabel.trim() !== "" ? response.anchorLabel : request.selectedText;
+    const linkText = `[[${newFile.path}|${linkLabel}]]`;
+    editor.replaceSelection(linkText);
+    if (response.isFallback) {
+      new import_obsidian3.Notice("AI response was unstructured. Created note with a default title.");
+    } else {
+      new import_obsidian3.Notice(`Successfully created note: ${newFile.basename}`);
+    }
+  }
+  async createNoteFile(response, request, parentFile) {
+    var _a;
     let targetFolder = ((_a = parentFile.parent) == null ? void 0 : _a.path) || "";
     if (request.saveLocation) {
       targetFolder = (0, import_obsidian3.normalizePath)(request.saveLocation);
@@ -15026,7 +15146,7 @@ var GeminiNotePlugin = class extends import_obsidian3.Plugin {
     const targetPath = (0, import_obsidian3.normalizePath)(`${targetFolder}/${safeTitle}.md`);
     if (this.app.vault.getAbstractFileByPath(targetPath)) {
       new import_obsidian3.Notice(`Note '${targetPath}' already exists. Aborting to prevent data loss.`);
-      return;
+      return null;
     }
     const parentLink = `Generated from: [[${parentFile.path}|${parentFile.basename}]]
 
@@ -15034,20 +15154,7 @@ var GeminiNotePlugin = class extends import_obsidian3.Plugin {
 
 `;
     const fullContent = parentLink + response.content;
-    const newFile = await this.app.vault.create(targetPath, fullContent);
-    const linkText = `[[${newFile.path}|${request.selectedText}]]`;
-    if (((_b = this.app.workspace.activeEditor) == null ? void 0 : _b.editor) === editor) {
-      editor.replaceSelection(linkText);
-    } else {
-      const currentParentText = await this.app.vault.read(parentFile);
-      const newParentText = currentParentText.replace(request.selectedText, linkText);
-      await this.app.vault.modify(parentFile, newParentText);
-    }
-    if (response.isFallback) {
-      new import_obsidian3.Notice("AI response was unstructured. Created note with a default title.");
-    } else {
-      new import_obsidian3.Notice(`Successfully created note: ${safeTitle}`);
-    }
+    return await this.app.vault.create(targetPath, fullContent);
   }
 };
 /*! Bundled license information:

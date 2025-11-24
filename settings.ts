@@ -1,3 +1,4 @@
+
 import { App, PluginSettingTab, Setting } from "obsidian";
 import GeminiNotePlugin from "./main";
 
@@ -125,15 +126,27 @@ export class GeminiNoteSettingTab extends PluginSettingTab {
                 }));
 
         // --- PROMPT CONFIGURATION ---
+        containerEl.createEl('h3', { text: 'Meta Prompts (System Instructions)' });
 
-        const promptControl = addBlockSetting('Meta Prompt', 'The system instruction sent to the AI. Explicitly define the JSON structure here.');
-        const promptInput = promptControl.createEl('textarea');
-        promptInput.style.width = '100%';
-        promptInput.style.height = '150px';
-        promptInput.style.fontFamily = 'monospace';
-        promptInput.value = this.plugin.settings.metaPrompt;
-        promptInput.addEventListener('change', async () => {
-             this.plugin.settings.metaPrompt = promptInput.value;
+        const createNotePromptControl = addBlockSetting('Create Note Meta Prompt', 'Instructions used when "Create New Note" is selected. MUST strictly enforce JSON output with "title", "content", and "anchorLabel".');
+        const createNotePromptInput = createNotePromptControl.createEl('textarea');
+        createNotePromptInput.style.width = '100%';
+        createNotePromptInput.style.height = '120px';
+        createNotePromptInput.style.fontFamily = 'monospace';
+        createNotePromptInput.value = this.plugin.settings.createNoteMetaPrompt;
+        createNotePromptInput.addEventListener('change', async () => {
+             this.plugin.settings.createNoteMetaPrompt = createNotePromptInput.value;
+             await this.plugin.saveSettings();
+        });
+
+        const inPlacePromptControl = addBlockSetting('In-Place Edit Meta Prompt', 'Instructions used when Replacing or Inserting text. Should encourage natural flow and context awareness. Expects raw text output.');
+        const inPlacePromptInput = inPlacePromptControl.createEl('textarea');
+        inPlacePromptInput.style.width = '100%';
+        inPlacePromptInput.style.height = '120px';
+        inPlacePromptInput.style.fontFamily = 'monospace';
+        inPlacePromptInput.value = this.plugin.settings.inPlaceMetaPrompt;
+        inPlacePromptInput.addEventListener('change', async () => {
+             this.plugin.settings.inPlaceMetaPrompt = inPlacePromptInput.value;
              await this.plugin.saveSettings();
         });
     }
