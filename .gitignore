@@ -1,0 +1,107 @@
+# ===================================================================
+#   Best Practice .gitignore for a Multi-Project / Monorepo Setup
+# ===================================================================
+# This file is placed at the repository root and applies to all
+# sub-projects (e.g., /frontend, /backend).
+
+# -------------------------------------------------------------------
+#  1. Dependencies & Lock Files
+# -------------------------------------------------------------------
+# Ignore node_modules directories in ANY subdirectory.
+# The trailing slash ensures we only match directories, not files.
+node_modules/
+
+# Package manager lock files are usually committed in monorepos to ensure
+# consistent dependencies across the entire project. Do NOT ignore them.
+
+
+# -------------------------------------------------------------------
+#  2. Environment Variables & Secret Files (CRITICAL FOR SECURITY)
+# -------------------------------------------------------------------
+# Ignore all .env files recursively in any directory.
+# This is the most critical security rule.
+.env
+.env.*
+
+# IMPORTANT: Do NOT ignore the example/template file. This rule will
+# un-ignore any file named .env.example, wherever it is.
+!/.env.example
+!/.env.template
+
+# Other common secret files
+*.pem
+*.key
+credentials.json
+*serviceAccountKey.json
+
+
+# -------------------------------------------------------------------
+#  3. Build Output & Compiled Files
+# -------------------------------------------------------------------
+# Ignore build output directories in ANY subdirectory.
+build/
+dist/
+.out/
+
+# Framework-specific build outputs (will match in any sub-project)
+.next/
+.nuxt/
+.svelte-kit/
+.vercel/
+
+
+# -------------------------------------------------------------------
+#  4. Logs
+# -------------------------------------------------------------------
+# Ignore log files wherever they appear.
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+
+# -------------------------------------------------------------------
+#  5. Testing & Coverage
+# -------------------------------------------------------------------
+# Ignore test reports and coverage analysis in any sub-project.
+coverage/
+lcov-report/
+
+
+# -------------------------------------------------------------------
+#  6. IDE & System Files
+# -------------------------------------------------------------------
+# These are user-specific and can appear anywhere.
+
+# VS Code (applies to root and any sub-project .vscode folder)
+.vscode/
+# Optionally, share workspace settings across the team.
+# The `!/` ensures we only un-ignore the root .vscode settings,
+# not individual ones in sub-projects unless you want that.
+!/.vscode/settings.json
+!/.vscode/tasks.json
+!/.vscode/launch.json
+!/.vscode/extensions.json
+
+# JetBrains (WebStorm, IntelliJ)
+.idea/
+
+# macOS
+.DS_Store
+._*
+
+# Windows
+Thumbs.db
+
+
+# -------------------------------------------------------------------
+#  7. Temporary & Cache Files
+# -------------------------------------------------------------------
+.npm/
+.yarn/cache
+.yarn/plug-n-play
+.yarn/unplugged
+.pnpm-store/
+*Zone.Identifier
+*Identifier

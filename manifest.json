@@ -1,0 +1,10 @@
+{
+  "id": "gemini-note",
+  "name": "Gemini Note Generator",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "Generate structured notes from selected text using Google Gemini API.",
+  "author": "Gemini Expert",
+  "authorUrl": "https://github.com/obsidian-plugins",
+  "isDesktopOnly": false
+}
