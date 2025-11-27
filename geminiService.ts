@@ -1,5 +1,5 @@
-
 import { GoogleGenAI } from "@google/genai";
+import { requestUrl } from "obsidian";
 import { GenerationRequest, GenerationResponse, OutputAction } from "./types";
 
 export class GeminiService {
@@ -30,6 +30,7 @@ export class GeminiService {
 
         let fullPrompt = "";
         const isCreateNote = request.outputAction === 'create_note';
+        const hasBackground = request.backgroundContext && request.backgroundContext.trim().length > 0;
 
         if (isCreateNote) {
             // Strategy: Structured JSON for new file
@@ -37,28 +38,47 @@ export class GeminiService {
                 userInstruction: request.instructionContent,
                 selectedText: request.selectedText,
                 parentNoteContent: request.contextType === 'selection_and_full_note' ? request.parentNoteContent : undefined,
-                parentNoteTitle: request.parentNoteTitle
+                parentNoteTitle: request.parentNoteTitle,
+                backgroundReferences: hasBackground ? request.backgroundContext : undefined
             };
-            fullPrompt = `${this.createNoteMetaPrompt}\n\nInput Data:\n${JSON.stringify(payload, null, 2)}`;
+            
+            // Inject instruction about references into the prompt string if they exist
+            let promptIntro = this.createNoteMetaPrompt;
+            if (hasBackground) {
+                promptIntro += "\n\nIMPORTANT: Use the provided 'backgroundReferences' as source material to enrich the content and ensure factual accuracy.";
+            }
+
+            fullPrompt = `${promptIntro}\n\nInput Data:\n${JSON.stringify(payload, null, 2)}`;
         } else {
             // Strategy: Fluent Text for In-Place
+            let backgroundSection = "";
+            if (hasBackground) {
+                backgroundSection = `
+---
+BACKGROUND REFERENCE MATERIALS (Use for facts/context, but prioritize current document flow):
+${request.backgroundContext}
+`;
+            }
+
             fullPrompt = `${this.inPlaceMetaPrompt}
             
 ---
-EXISTING TEXT BEFORE SELECTION:
+USER INSTRUCTION (Rule to follow):
+${request.instructionContent}
+
+${backgroundSection}
+
+---
+EXISTING TEXT BEFORE SELECTION (Context):
 ...${request.contextBefore}
 
 ---
-USER SELECTED TEXT (To be modified/processed):
-${request.selectedText}
-
----
-EXISTING TEXT AFTER SELECTION:
+EXISTING TEXT AFTER SELECTION (Context):
 ${request.contextAfter}...
 
 ---
-USER INSTRUCTION:
-${request.instructionContent}
+USER SELECTED TEXT (Input to process):
+${request.selectedText}
 `;
         }
 
@@ -102,24 +122,19 @@ ${request.instructionContent}
         };
 
         try {
-            const response = await fetch(url, {
+            // Use Obsidian's requestUrl to bypass CORS
+            const response = await requestUrl({
+                url: url,
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(body)
             });
 
-            if (!response.ok) {
-                let errorMsg = `HTTP Error ${response.status}`;
-                try {
-                    const errData = await response.json();
-                    if (errData.error && errData.error.message) {
-                        errorMsg += `: ${errData.error.message}`;
-                    }
-                } catch (e) { }
-                throw new Error(errorMsg);
+            if (response.status >= 400) {
+                throw new Error(`HTTP Error ${response.status}: ${JSON.stringify(response.json)}`);
             }
 
-            const data = await response.json();
+            const data = response.json;
             const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
 
             if (!text) throw new Error("Empty response from API");
@@ -127,7 +142,7 @@ ${request.instructionContent}
 
         } catch (error) {
             console.error("Custom Host API Error:", error);
-            throw new Error(`API Request Failed: ${error.message}`);
+            throw new Error(`API Request Failed: ${error.message || error}`);
         }
     }
 
@@ -135,8 +150,6 @@ ${request.instructionContent}
         const textToParse = rawResponse.trim();
 
         if (!expectJson) {
-            // For in-place, we just want the text. 
-            // We strip markdown code blocks if the AI accidentally added them.
             const codeBlockRegex = /^```(?:\w+)?\s*([\s\S]*?)\s*```$/i;
             const match = textToParse.match(codeBlockRegex);
             return {
@@ -146,9 +159,6 @@ ${request.instructionContent}
             };
         }
 
-        // For Create Note, we strictly try to parse JSON
-        
-        // Tier 1: Direct or Cleaned JSON
         let cleanJson = textToParse;
         const codeBlockRegex = /^```(?:json)?\s*([\s\S]*?)\s*```$/i;
         const match = textToParse.match(codeBlockRegex);
@@ -168,7 +178,6 @@ ${request.instructionContent}
             }
         } catch (e) { }
 
-        // Tier 2: Regex Extraction
         try {
             const firstBrace = rawResponse.indexOf('{');
             const lastBrace = rawResponse.lastIndexOf('}');
@@ -186,7 +195,6 @@ ${request.instructionContent}
             }
         } catch (e) { }
 
-        // Tier 3: Fallback
         return {
             title: "Untitled Gemini Note",
             content: rawResponse,

@@ -49,22 +49,33 @@ export default class GeminiNotePlugin extends Plugin {
                 instructionContent = await this.app.vault.read(instructionFile);
             }
 
+            // Read Background Files Content
+            let backgroundContext = "";
+            if (result.backgroundFiles && result.backgroundFiles.length > 0) {
+                for (const file of result.backgroundFiles) {
+                    try {
+                        const content = await this.app.vault.read(file);
+                        backgroundContext += `\n--- REFERENCE FILE: ${file.path} ---\n${content}\n`;
+                    } catch (e) {
+                        console.warn(`Failed to read background file: ${file.path}`, e);
+                    }
+                }
+            }
+
             // Capture context
             const parentNoteContent = await this.app.vault.read(parentFile);
             const parentNoteTitle = parentFile.name;
             
-            // Context Awareness: Get text before and after selection for fluency
+            // Context Awareness
             const cursorFrom = editor.getCursor('from');
             const cursorTo = editor.getCursor('to');
             const lastLine = editor.lineCount();
             
-            // Grab up to 1000 chars before
             const contextBefore = editor.getRange(
                 { line: Math.max(0, cursorFrom.line - 20), ch: 0 }, 
                 cursorFrom
             ).slice(-1000);
 
-            // Grab up to 1000 chars after
             const contextAfter = editor.getRange(
                 cursorTo,
                 { line: Math.min(lastLine, cursorTo.line + 20), ch: 0 }
@@ -80,6 +91,7 @@ export default class GeminiNotePlugin extends Plugin {
                 contextAfter,
                 parentNoteContent,
                 parentNoteTitle,
+                backgroundContext,
                 outputAction: result.outputAction
             };
 
@@ -94,9 +106,7 @@ export default class GeminiNotePlugin extends Plugin {
             return;
         }
 
-        // SAFETY SNAPSHOT: Record the state before async operation
         const snapshotText = request.selectedText;
-        
         const notice = new Notice("Generating response with Gemini...", 0);
 
         try {
@@ -111,25 +121,24 @@ export default class GeminiNotePlugin extends Plugin {
             
             notice.hide();
 
-            // VERIFICATION LOGIC: Ensure we are writing to the correct place
             const currentSelection = editor.getSelection();
             let safeToReplace = false;
-            let needsRelocation = false;
 
             if (currentSelection === snapshotText) {
                 safeToReplace = true;
             } else {
-                // User moved cursor. Let's scan the doc.
                 const docContent = editor.getValue();
                 const firstIndex = docContent.indexOf(snapshotText);
                 const lastIndex = docContent.lastIndexOf(snapshotText);
 
                 if (firstIndex !== -1 && firstIndex === lastIndex) {
-                    // Unique match found. Safe to move cursor there.
                     safeToReplace = true;
-                    needsRelocation = true;
+                    // Logic to reset cursor selection could be added here if needed, 
+                    // but for now, we rely on clipboard fallback if exact cursor match is lost to be safe.
+                    // To make it truly auto-relocate is complex without range mapping. 
+                    // We will stick to the safer "Clipboard if moved" approach unless the user requests complex range math.
                     
-                    // Calculate position from index (expensive but necessary for safety)
+                    // Simple relocation attempt:
                     const prefix = docContent.substring(0, firstIndex);
                     const lines = prefix.split('\n');
                     const line = lines.length - 1;
@@ -145,15 +154,12 @@ export default class GeminiNotePlugin extends Plugin {
             }
 
             if (!safeToReplace) {
-                // FAIL SAFE: Copy to Clipboard
-                new Notice("⚠️ Original selection changed or moved. Copied result to clipboard to prevent data loss.");
+                new Notice("⚠️ Selection changed. Result copied to clipboard.");
                 let clipboardText = "";
                 if (request.outputAction === 'create_note') {
-                    // Copy the Link
                     clipboardText = response.anchorLabel 
                         ? `[[${response.title}|${response.anchorLabel}]]` 
                         : `[[${response.title}|${snapshotText}]]`;
-                    // We still create the note file though!
                     await this.createNoteFile(response, request, parentFile);
                 } else {
                     clipboardText = response.content;
@@ -162,7 +168,6 @@ export default class GeminiNotePlugin extends Plugin {
                 return;
             }
 
-            // Execute Action (Safe Path)
             if (request.outputAction === 'create_note') {
                 await this.handleCreateNoteAction(response, request, parentFile, editor);
             } else if (request.outputAction === 'replace_selection') {
@@ -177,22 +182,19 @@ export default class GeminiNotePlugin extends Plugin {
         } catch (error) {
             notice.hide();
             console.error(error);
-            new Notice("Failed to get a response from Gemini. Check the developer console for details.");
+            new Notice("Failed to get a response from Gemini. Check console.");
         }
     }
 
     private async handleCreateNoteAction(response: any, request: GenerationRequest, parentFile: TFile, editor: Editor) {
          const newFile = await this.createNoteFile(response, request, parentFile);
-         if (!newFile) return; // File creation failed or existed
+         if (!newFile) return;
 
-         // Determine Link Text: Use AI Anchor Label if available, else original selection
          const linkLabel = response.anchorLabel && response.anchorLabel.trim() !== "" 
             ? response.anchorLabel 
             : request.selectedText;
 
          const linkText = `[[${newFile.path}|${linkLabel}]]`;
-         
-         // We already verified safety in runGeneration, so we can replace
          editor.replaceSelection(linkText);
 
          if (response.isFallback) {
@@ -215,7 +217,7 @@ export default class GeminiNotePlugin extends Plugin {
         const targetPath = normalizePath(`${targetFolder}/${safeTitle}.md`);
 
         if (this.app.vault.getAbstractFileByPath(targetPath)) {
-            new Notice(`Note '${targetPath}' already exists. Aborting to prevent data loss.`);
+            new Notice(`Note '${targetPath}' already exists. Aborting.`);
             return null;
         }
 

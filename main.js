@@ -27,7 +27,7 @@ __export(main_exports, {
   default: () => GeminiNotePlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian3 = require("obsidian");
+var import_obsidian4 = require("obsidian");
 
 // types.ts
 var DEFAULT_SETTINGS = {
@@ -38,18 +38,42 @@ var DEFAULT_SETTINGS = {
   defaultContext: "selection_only",
   defaultSaveLocation: "",
   defaultOutputAction: "create_note",
-  createNoteMetaPrompt: `You are an assistant integrated into an Obsidian note-taking app. 
-Your task is to process the user's request and provide a structured JSON response for a NEW NOTE.
-Return a JSON object with:
-- "title": A concise filename.
-- "content": The encyclopedic or detailed content of the note.
-- "anchorLabel": A short, descriptive phrase (2-5 words) summarizing the user's selected text. This will be used as the link text in the parent note.
-Output ONLY the raw JSON string. Do not wrap it in markdown code blocks.`,
-  inPlaceMetaPrompt: `You are an expert editor and co-author. 
-Your task is to generate text that fits seamlessly into an existing document.
-You will be provided with the text BEFORE the selection, the SELECTION itself, and the text AFTER.
-Based on the user's instruction, rewrite or expand the SELECTION so it flows naturally between the BEFORE and AFTER context.
-Output ONLY the new text content. Do not output JSON. Do not include conversational filler.`
+  createNoteMetaPrompt: `You are an expert Knowledge Manager and Obsidian Assistant.
+Your goal is to process the user's input and generate a structured JSON response for a NEW NOTE.
+
+### INPUT DATA:
+1. **userInstruction**: The specific task (e.g., "Summarize", "Explain").
+2. **selectedText**: The core subject.
+3. **parentNoteContent**: Context from the source note.
+4. **backgroundReferences** (Optional): Additional factual context. Use this to enrich the content.
+
+### OUTPUT FORMAT RULES (CRITICAL):
+1. Output ONLY a valid, parseable JSON object.
+2. Do NOT wrap the JSON in markdown code blocks. Output raw JSON only.
+3. The JSON must have exactly these keys:
+   - "title": A concise, safe filename.
+   - "content": Detailed Markdown body. Synthesize the "selectedText" with "backgroundReferences".
+   - "anchorLabel": A short (2-5 words) summary phrase for the link.
+
+### STRICT REQUIREMENTS:
+- **Language**: Match the language of the \`selectedText\`.
+- **Purity**: Start with \`{\` and end with \`}\`. No introductory text.`,
+  inPlaceMetaPrompt: `**Persona:** You are a "Seamless Splicer," an expert Ghostwriter.
+**Goal:** Generate text that replaces the \`SELECTION\` based on the \`INSTRUCTION\`, bridging the \`BEFORE\` and \`AFTER\` context perfectly.
+
+### INPUT DATA:
+1. **INSTRUCTION**: The rule to apply.
+2. **BEFORE & AFTER**: Contextual anchors for tone/style.
+3. **SELECTION**: The text to modify.
+4. **BACKGROUND REFERENCES**: Optional facts to incorporate.
+
+### EXECUTION RULES:
+1. **Context Awareness**: Match the tense, tone, and format of the surrounding text.
+2. **Use References**: If background references are present, use them for accuracy.
+3. **No Filler**: Return ONLY the result text. No "Here is the text".
+
+### OUTPUT:
+Return ONLY the raw text to be inserted.`
 };
 
 // settings.ts
@@ -150,21 +174,30 @@ var GenerationConfigModal = class extends import_obsidian2.Modal {
   constructor(app, settings, onSubmit) {
     super(app);
     this.selectedInstructionPath = "";
+    // Background File Selection State
+    this.selectedBackgroundFiles = [];
+    this.allMarkdownFiles = [];
     this.settings = settings;
     this.onSubmit = onSubmit;
     this.selectedContext = settings.defaultContext;
     this.saveLocation = settings.defaultSaveLocation;
     this.selectedOutputAction = settings.defaultOutputAction;
+    this.selectedInstructionPath = "";
+    this.allMarkdownFiles = [];
   }
   async onOpen() {
+    this.allMarkdownFiles = this.app.vault.getMarkdownFiles();
     const { contentEl } = this;
     contentEl.empty();
+    contentEl.addClass("gemini-gen-modal");
     contentEl.createEl("h2", { text: "Generate Note with Gemini" });
     const instructions = this.getInstructionFiles();
     if (instructions.length === 0) {
       new import_obsidian2.Setting(contentEl).setName("Task Instruction").setDesc("No instructions found in the configured folder.").setDisabled(true);
     } else {
-      this.selectedInstructionPath = instructions[0].path;
+      if (!this.selectedInstructionPath && instructions.length > 0) {
+        this.selectedInstructionPath = instructions[0].path;
+      }
       new import_obsidian2.Setting(contentEl).setName("Task Instruction").setDesc("Select a template for generation").addDropdown((dropdown) => {
         instructions.forEach((file) => {
           dropdown.addOption(file.path, file.basename);
@@ -175,7 +208,7 @@ var GenerationConfigModal = class extends import_obsidian2.Modal {
         });
       });
     }
-    new import_obsidian2.Setting(contentEl).setName("Context").setDesc("What data to send to the AI").addDropdown((dropdown) => {
+    new import_obsidian2.Setting(contentEl).setName("Target Context").setDesc("Scope of the active note to send").addDropdown((dropdown) => {
       dropdown.addOption("selection_only", "Selection Only");
       dropdown.addOption("selection_and_full_note", "Selection + Full Parent Note");
       dropdown.setValue(this.selectedContext);
@@ -183,6 +216,75 @@ var GenerationConfigModal = class extends import_obsidian2.Modal {
         this.selectedContext = value;
       });
     });
+    const refContainer = contentEl.createDiv("reference-files-container");
+    refContainer.style.borderTop = "1px solid var(--background-modifier-border)";
+    refContainer.style.marginTop = "15px";
+    refContainer.style.paddingTop = "10px";
+    refContainer.createEl("h4", { text: "Background Reference Files (Optional)" });
+    refContainer.createEl("small", { text: "Search and add files to provide extra context." }).style.display = "block";
+    const selectedListEl = refContainer.createDiv("selected-files-list");
+    selectedListEl.style.marginBottom = "10px";
+    selectedListEl.style.display = "flex";
+    selectedListEl.style.flexWrap = "wrap";
+    selectedListEl.style.gap = "5px";
+    const renderSelectedFiles = () => {
+      selectedListEl.empty();
+      this.selectedBackgroundFiles.forEach((file, index) => {
+        const tag = selectedListEl.createDiv("nav-file-tag");
+        tag.style.display = "flex";
+        tag.style.alignItems = "center";
+        tag.style.backgroundColor = "var(--background-secondary)";
+        tag.style.padding = "2px 8px";
+        tag.style.borderRadius = "4px";
+        tag.style.fontSize = "0.9em";
+        tag.createSpan({ text: file.basename });
+        const removeBtn = tag.createSpan({ text: " \xD7" });
+        removeBtn.style.cursor = "pointer";
+        removeBtn.style.marginLeft = "5px";
+        removeBtn.style.color = "var(--text-muted)";
+        removeBtn.onclick = () => {
+          this.selectedBackgroundFiles.splice(index, 1);
+          renderSelectedFiles();
+        };
+      });
+    };
+    const searchContainer = refContainer.createDiv("search-input-container");
+    const resultsContainer = refContainer.createDiv("search-results");
+    resultsContainer.style.maxHeight = "150px";
+    resultsContainer.style.overflowY = "auto";
+    resultsContainer.style.border = "1px solid var(--background-modifier-border)";
+    resultsContainer.style.display = "none";
+    const searchInput = searchContainer.createEl("input", { type: "text", placeholder: "Search vault files (path or name)..." });
+    searchInput.style.width = "100%";
+    searchInput.addEventListener("input", (e) => {
+      const query = e.target.value.toLowerCase();
+      resultsContainer.empty();
+      if (query.length < 2) {
+        resultsContainer.style.display = "none";
+        return;
+      }
+      const matches = this.allMarkdownFiles.filter((f) => f.path.toLowerCase().includes(query) && !this.selectedBackgroundFiles.includes(f)).slice(0, 10);
+      if (matches.length > 0) {
+        resultsContainer.style.display = "block";
+        matches.forEach((file) => {
+          const resultItem = resultsContainer.createDiv("suggestion-item");
+          resultItem.style.padding = "5px 10px";
+          resultItem.style.cursor = "pointer";
+          resultItem.innerText = file.path;
+          resultItem.onmouseenter = () => resultItem.style.backgroundColor = "var(--background-secondary)";
+          resultItem.onmouseleave = () => resultItem.style.backgroundColor = "transparent";
+          resultItem.onclick = () => {
+            this.selectedBackgroundFiles.push(file);
+            renderSelectedFiles();
+            searchInput.value = "";
+            resultsContainer.style.display = "none";
+          };
+        });
+      } else {
+        resultsContainer.style.display = "none";
+      }
+    });
+    renderSelectedFiles();
     new import_obsidian2.Setting(contentEl).setName("Output Action").setDesc("How to handle the generated result").addDropdown((dropdown) => {
       dropdown.addOption("create_note", "Create New Note");
       dropdown.addOption("replace_selection", "Replace Selected Text");
@@ -229,7 +331,8 @@ var GenerationConfigModal = class extends import_obsidian2.Modal {
       instructionPath: this.selectedInstructionPath,
       contextType: this.selectedContext,
       saveLocation: this.saveLocation,
-      outputAction: this.selectedOutputAction
+      outputAction: this.selectedOutputAction,
+      backgroundFiles: this.selectedBackgroundFiles
     });
   }
   getInstructionFiles() {
@@ -14827,6 +14930,7 @@ var GoogleGenAI = class {
 };
 
 // geminiService.ts
+var import_obsidian3 = require("obsidian");
 var GeminiService = class {
   constructor(apiKey, apiHost, modelName, createNoteMetaPrompt, inPlaceMetaPrompt) {
     this.apiKey = apiKey;
@@ -14841,35 +14945,51 @@ var GeminiService = class {
     }
     let fullPrompt = "";
     const isCreateNote = request.outputAction === "create_note";
+    const hasBackground = request.backgroundContext && request.backgroundContext.trim().length > 0;
     if (isCreateNote) {
       const payload = {
         userInstruction: request.instructionContent,
         selectedText: request.selectedText,
         parentNoteContent: request.contextType === "selection_and_full_note" ? request.parentNoteContent : void 0,
-        parentNoteTitle: request.parentNoteTitle
+        parentNoteTitle: request.parentNoteTitle,
+        backgroundReferences: hasBackground ? request.backgroundContext : void 0
       };
-      fullPrompt = `${this.createNoteMetaPrompt}
+      let promptIntro = this.createNoteMetaPrompt;
+      if (hasBackground) {
+        promptIntro += "\n\nIMPORTANT: Use the provided 'backgroundReferences' as source material to enrich the content and ensure factual accuracy.";
+      }
+      fullPrompt = `${promptIntro}
 
 Input Data:
 ${JSON.stringify(payload, null, 2)}`;
     } else {
+      let backgroundSection = "";
+      if (hasBackground) {
+        backgroundSection = `
+---
+BACKGROUND REFERENCE MATERIALS (Use for facts/context, but prioritize current document flow):
+${request.backgroundContext}
+`;
+      }
       fullPrompt = `${this.inPlaceMetaPrompt}
             
 ---
-EXISTING TEXT BEFORE SELECTION:
+USER INSTRUCTION (Rule to follow):
+${request.instructionContent}
+
+${backgroundSection}
+
+---
+EXISTING TEXT BEFORE SELECTION (Context):
 ...${request.contextBefore}
 
 ---
-USER SELECTED TEXT (To be modified/processed):
-${request.selectedText}
-
----
-EXISTING TEXT AFTER SELECTION:
+EXISTING TEXT AFTER SELECTION (Context):
 ${request.contextAfter}...
 
 ---
-USER INSTRUCTION:
-${request.instructionContent}
+USER SELECTED TEXT (Input to process):
+${request.selectedText}
 `;
     }
     let responseText = "";
@@ -14907,30 +15027,23 @@ ${request.instructionContent}
       contents: [{ parts: [{ text: prompt }] }]
     };
     try {
-      const response = await fetch(url, {
+      const response = await (0, import_obsidian3.requestUrl)({
+        url,
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body)
       });
-      if (!response.ok) {
-        let errorMsg = `HTTP Error ${response.status}`;
-        try {
-          const errData = await response.json();
-          if (errData.error && errData.error.message) {
-            errorMsg += `: ${errData.error.message}`;
-          }
-        } catch (e) {
-        }
-        throw new Error(errorMsg);
+      if (response.status >= 400) {
+        throw new Error(`HTTP Error ${response.status}: ${JSON.stringify(response.json)}`);
       }
-      const data = await response.json();
+      const data = response.json;
       const text = (_e = (_d = (_c = (_b = (_a = data.candidates) == null ? void 0 : _a[0]) == null ? void 0 : _b.content) == null ? void 0 : _c.parts) == null ? void 0 : _d[0]) == null ? void 0 : _e.text;
       if (!text)
         throw new Error("Empty response from API");
       return text;
     } catch (error) {
       console.error("Custom Host API Error:", error);
-      throw new Error(`API Request Failed: ${error.message}`);
+      throw new Error(`API Request Failed: ${error.message || error}`);
     }
   }
   parseResponse(rawResponse, expectJson) {
@@ -14991,7 +15104,7 @@ ${request.instructionContent}
 };
 
 // main.ts
-var GeminiNotePlugin = class extends import_obsidian3.Plugin {
+var GeminiNotePlugin = class extends import_obsidian4.Plugin {
   async onload() {
     await this.loadSettings();
     this.addSettingTab(new GeminiNoteSettingTab(this.app, this));
@@ -15012,7 +15125,7 @@ var GeminiNotePlugin = class extends import_obsidian3.Plugin {
   handleGenerateCommand(editor, view) {
     const selectedText = editor.getSelection();
     if (!selectedText) {
-      new import_obsidian3.Notice("Please select some text first.");
+      new import_obsidian4.Notice("Please select some text first.");
       return;
     }
     const parentFile = view.file;
@@ -15021,8 +15134,22 @@ var GeminiNotePlugin = class extends import_obsidian3.Plugin {
     new GenerationConfigModal(this.app, this.settings, async (result) => {
       const instructionFile = this.app.vault.getAbstractFileByPath(result.instructionPath);
       let instructionContent = "";
-      if (instructionFile instanceof import_obsidian3.TFile) {
+      if (instructionFile instanceof import_obsidian4.TFile) {
         instructionContent = await this.app.vault.read(instructionFile);
+      }
+      let backgroundContext = "";
+      if (result.backgroundFiles && result.backgroundFiles.length > 0) {
+        for (const file of result.backgroundFiles) {
+          try {
+            const content = await this.app.vault.read(file);
+            backgroundContext += `
+--- REFERENCE FILE: ${file.path} ---
+${content}
+`;
+          } catch (e) {
+            console.warn(`Failed to read background file: ${file.path}`, e);
+          }
+        }
       }
       const parentNoteContent = await this.app.vault.read(parentFile);
       const parentNoteTitle = parentFile.name;
@@ -15047,6 +15174,7 @@ var GeminiNotePlugin = class extends import_obsidian3.Plugin {
         contextAfter,
         parentNoteContent,
         parentNoteTitle,
+        backgroundContext,
         outputAction: result.outputAction
       };
       this.runGeneration(request, parentFile, editor);
@@ -15054,11 +15182,11 @@ var GeminiNotePlugin = class extends import_obsidian3.Plugin {
   }
   async runGeneration(request, parentFile, editor) {
     if (!this.settings.apiKey) {
-      new import_obsidian3.Notice("Gemini API key is not set. Please configure it in the plugin settings.");
+      new import_obsidian4.Notice("Gemini API key is not set. Please configure it in the plugin settings.");
       return;
     }
     const snapshotText = request.selectedText;
-    const notice = new import_obsidian3.Notice("Generating response with Gemini...", 0);
+    const notice = new import_obsidian4.Notice("Generating response with Gemini...", 0);
     try {
       const service = new GeminiService(
         this.settings.apiKey,
@@ -15071,7 +15199,6 @@ var GeminiNotePlugin = class extends import_obsidian3.Plugin {
       notice.hide();
       const currentSelection = editor.getSelection();
       let safeToReplace = false;
-      let needsRelocation = false;
       if (currentSelection === snapshotText) {
         safeToReplace = true;
       } else {
@@ -15080,7 +15207,6 @@ var GeminiNotePlugin = class extends import_obsidian3.Plugin {
         const lastIndex = docContent.lastIndexOf(snapshotText);
         if (firstIndex !== -1 && firstIndex === lastIndex) {
           safeToReplace = true;
-          needsRelocation = true;
           const prefix = docContent.substring(0, firstIndex);
           const lines = prefix.split("\n");
           const line = lines.length - 1;
@@ -15093,7 +15219,7 @@ var GeminiNotePlugin = class extends import_obsidian3.Plugin {
         }
       }
       if (!safeToReplace) {
-        new import_obsidian3.Notice("\u26A0\uFE0F Original selection changed or moved. Copied result to clipboard to prevent data loss.");
+        new import_obsidian4.Notice("\u26A0\uFE0F Selection changed. Result copied to clipboard.");
         let clipboardText = "";
         if (request.outputAction === "create_note") {
           clipboardText = response.anchorLabel ? `[[${response.title}|${response.anchorLabel}]]` : `[[${response.title}|${snapshotText}]]`;
@@ -15108,16 +15234,16 @@ var GeminiNotePlugin = class extends import_obsidian3.Plugin {
         await this.handleCreateNoteAction(response, request, parentFile, editor);
       } else if (request.outputAction === "replace_selection") {
         editor.replaceSelection(response.content);
-        new import_obsidian3.Notice("Replaced text with AI generation.");
+        new import_obsidian4.Notice("Replaced text with AI generation.");
       } else if (request.outputAction === "insert_after") {
         const newText = snapshotText + "\n\n" + response.content;
         editor.replaceSelection(newText);
-        new import_obsidian3.Notice("Inserted AI generation after selection.");
+        new import_obsidian4.Notice("Inserted AI generation after selection.");
       }
     } catch (error) {
       notice.hide();
       console.error(error);
-      new import_obsidian3.Notice("Failed to get a response from Gemini. Check the developer console for details.");
+      new import_obsidian4.Notice("Failed to get a response from Gemini. Check console.");
     }
   }
   async handleCreateNoteAction(response, request, parentFile, editor) {
@@ -15128,24 +15254,24 @@ var GeminiNotePlugin = class extends import_obsidian3.Plugin {
     const linkText = `[[${newFile.path}|${linkLabel}]]`;
     editor.replaceSelection(linkText);
     if (response.isFallback) {
-      new import_obsidian3.Notice("AI response was unstructured. Created note with a default title.");
+      new import_obsidian4.Notice("AI response was unstructured. Created note with a default title.");
     } else {
-      new import_obsidian3.Notice(`Successfully created note: ${newFile.basename}`);
+      new import_obsidian4.Notice(`Successfully created note: ${newFile.basename}`);
     }
   }
   async createNoteFile(response, request, parentFile) {
     var _a;
     let targetFolder = ((_a = parentFile.parent) == null ? void 0 : _a.path) || "";
     if (request.saveLocation) {
-      targetFolder = (0, import_obsidian3.normalizePath)(request.saveLocation);
+      targetFolder = (0, import_obsidian4.normalizePath)(request.saveLocation);
       if (!this.app.vault.getAbstractFileByPath(targetFolder)) {
         await this.app.vault.createFolder(targetFolder);
       }
     }
     const safeTitle = response.title.replace(/[\\/:*?"<>|]/g, "").trim();
-    const targetPath = (0, import_obsidian3.normalizePath)(`${targetFolder}/${safeTitle}.md`);
+    const targetPath = (0, import_obsidian4.normalizePath)(`${targetFolder}/${safeTitle}.md`);
     if (this.app.vault.getAbstractFileByPath(targetPath)) {
-      new import_obsidian3.Notice(`Note '${targetPath}' already exists. Aborting to prevent data loss.`);
+      new import_obsidian4.Notice(`Note '${targetPath}' already exists. Aborting.`);
       return null;
     }
     const parentLink = `Generated from: [[${parentFile.path}|${parentFile.basename}]]
